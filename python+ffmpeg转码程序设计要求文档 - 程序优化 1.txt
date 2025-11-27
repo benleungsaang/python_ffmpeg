@@ -1,0 +1,30 @@
+参考以下计算方法对视频文件进行先计算判断如果符合预估算体积小于原体积才执行转码，如果预估体积比原体积大，直接不执行计算，执行复制原文件并改名即可，转码状态记录来“预估体积为 xx MB，执行改名不转码”
+
+# 步骤1：获取源文件视频平均码率（bps）
+$sourceVbrOutput = ffprobe -v quiet -select_streams v:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 $INPUT_FILE
+$SOURCE_VBR = [int]$sourceVbrOutput
+# 若未获取到码率，用文件大小+时长计算
+if (-not $SOURCE_VBR -or $SOURCE_VBR -eq 0) {
+    $duration = [int](ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $INPUT_FILE -hide_banner)
+    $fileSize = (Get-Item $INPUT_FILE).Length
+    $SOURCE_VBR = ($fileSize * 8) / $duration
+}
+$SOURCE_VBR_MBPS = [math]::Round($SOURCE_VBR / 1000000, 2)
+Write-Host "源文件视频平均码率：$SOURCE_VBR_MBPS Mbps"
+
+# 步骤2：计算目标maxrate（≤8.5Mbps 且 ≤ 源码率×90%）
+$TARGET_MAXRATE = [int]($SOURCE_VBR * 0.9)
+if ($TARGET_MAXRATE -gt $MAX_MAXRATE) {
+    $TARGET_MAXRATE = $MAX_MAXRATE
+}
+$TARGET_BUFSIZE = $TARGET_MAXRATE * 2
+$TARGET_MAXRATE_MBPS = [math]::Round($TARGET_MAXRATE / 1000000, 2)
+Write-Host "目标maxrate：$TARGET_MAXRATE_MBPS Mbps（≤8.5Mbps 且 ≤ 源码率90%）"
+
+# 步骤3：预估体积
+$ORIGINAL_SIZE = (Get-Item $INPUT_FILE).Length
+$duration = [double](ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $INPUT_FILE -hide_banner)
+$EST_OUTPUT_SIZE = [int](($TARGET_MAXRATE + $AUDIO_BITRATE) * $duration / 8 * 1.01)
+$ORIGINAL_SIZE_MB = [math]::Round($ORIGINAL_SIZE / 1024 / 1024, 2)
+$EST_OUTPUT_SIZE_MB = [math]::Round($EST_OUTPUT_SIZE / 1024 / 1024, 2)
+Write-Host "源文件体积：$ORIGINAL_SIZE_MB MB，预估输出体积：$EST_OUTPUT_SIZE_MB MB"

@@ -1,0 +1,28 @@
+1、参考以下代码对当前文件进行修改，并且后续计算出预估参数后，不用等当前任务执行完成，优先把预估大小更新到列表上；
+2、在“开始任务”旁边增加一个新的按钮，“计算预估大小”，仅执行预估计算，并更新在列表上。
+
+匹配 CRF 模式的预估逻辑：通过测试不同类型视频在CRF=28下的实际码率分布，建立基于分辨率、内容复杂度的码率模型（例如：1080P 动作片平均码率 4Mbps，纪录片 2Mbps），而非依赖源码率比例。
+修正源码率计算方式：使用ffprobe直接提取视频流的码率（排除音频和容器）：
+
+
+# 提取视频流码率
+cmd = f'ffprobe -v quiet -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "{input_path}"'
+result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, text=True)
+video_bitrate = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
+动态计算音频码率：提取原视频音频流的码率和轨道数，按实际转码后的音频参数（如声道数、编码格式）调整预估：
+
+
+# 提取音频流信息
+cmd = f'ffprobe -v quiet -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "{input_path}"'
+audio_bitrate = int(subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, text=True).stdout.strip()) or 128000
+引入分辨率权重：根据原视频分辨率与目标分辨率（1080P）的比例调整码率预估，例如：
+
+
+# 获取原视频分辨率
+cmd = f'ffprobe -v quiet -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "{input_path}"'
+res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+width, height = map(int, res.split('x')) if res else (1920, 1080)
+# 计算分辨率缩放比例（相对于1080P）
+res_scale = (width * height) / (1920 * 1080)
+target_maxrate = int(source_vbr * 0.9 * res_scale)  # 乘以分辨率比例
+通过以上调整，可大幅降低预估偏差，使误差控制在合理范围内（通常 10%-20%）。

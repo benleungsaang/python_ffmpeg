@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
+from pathlib import Path
 import threading
 import time
 import subprocess
@@ -75,7 +76,7 @@ class VideoTranscoderApp:
 
         ttk.Button(scan_controls_frame, text="扫描", command=self.scan_videos).pack(side=tk.LEFT, padx=(0, 10))
 
-        self.overwrite_var = tk.BooleanVar(value=True)  # 默认选中
+        self.overwrite_var = tk.BooleanVar(value=False)  # 默认不选中
         ttk.Checkbutton(scan_controls_frame, text="转码后输出到原目录", variable=self.overwrite_var).pack(side=tk.LEFT)
 
         # 4. 当前任务进度条
@@ -98,24 +99,30 @@ class VideoTranscoderApp:
         task_frame.rowconfigure(0, weight=1)
 
         # 创建任务列表表格
-        columns = ("filename", "original_size", "transcoded_size", "completed_time", "duration", "status")
+        columns = ("index", "filename", "original_size", "estimated_size", "transcoded_size", "completed_time", "duration", "operation", "status")
         self.task_tree = ttk.Treeview(task_frame, columns=columns, show="headings", height=8)
 
         # 定义列标题
+        self.task_tree.heading("index", text="序号")
         self.task_tree.heading("filename", text="文件名")
         self.task_tree.heading("original_size", text="原文件大小")
+        self.task_tree.heading("estimated_size", text="预估转码大小")
         self.task_tree.heading("transcoded_size", text="转码后大小")
         self.task_tree.heading("completed_time", text="完成时间")
         self.task_tree.heading("duration", text="转码用时")
+        self.task_tree.heading("operation", text="执行操作")
         self.task_tree.heading("status", text="转码状态")
 
         # 设置列宽
-        self.task_tree.column("filename", width=180)
+        self.task_tree.column("index", width=40, anchor="center")  # 序号列较窄并居中
+        self.task_tree.column("filename", width=150)
         self.task_tree.column("original_size", width=80)
+        self.task_tree.column("estimated_size", width=90)
         self.task_tree.column("transcoded_size", width=80)
         self.task_tree.column("completed_time", width=120)
         self.task_tree.column("duration", width=80)
-        self.task_tree.column("status", width=80)
+        self.task_tree.column("operation", width=100)
+        self.task_tree.column("status", width=100)
 
         # 添加滚动条
         scrollbar = ttk.Scrollbar(task_frame, orient=tk.VERTICAL, command=self.task_tree.yview)
@@ -144,9 +151,13 @@ class VideoTranscoderApp:
         self.root.drop_target_register(DND_FILES)
         self.root.dnd_bind('<<Drop>>', self.on_general_drop)
 
+        # 任务统计信息标签
+        self.stats_label = ttk.Label(main_frame, text="任务统计：共0个任务，待处理0个，已完成0个，失败0个")
+        self.stats_label.grid(row=11, column=0, columnspan=2, sticky=tk.W, pady=(5, 5))
+
         # 7. 任务执行按钮区域
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=11, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=12, column=0, columnspan=2, pady=10)
         button_frame.columnconfigure(0, weight=1)
 
         # 配置开始按钮宽度为整程序宽度，高度为4行高
@@ -154,7 +165,10 @@ class VideoTranscoderApp:
         self.task_control_button.grid(row=0, column=0, sticky=(tk.W, tk.E), ipady=20)  # 增加高度
 
         bottom_button_frame = ttk.Frame(main_frame)
-        bottom_button_frame.grid(row=12, column=0, columnspan=2, pady=5)
+        bottom_button_frame.grid(row=13, column=0, columnspan=2, pady=5)
+
+        self.estimate_button = ttk.Button(bottom_button_frame, text="计算预估大小", command=self.calculate_all_estimates)
+        self.estimate_button.pack(side=tk.LEFT, padx=(0, 10))
 
         self.config_button = ttk.Button(bottom_button_frame, text="配置转码参数", command=self.open_config_dialog)
         self.config_button.pack(side=tk.LEFT, padx=(0, 10))
@@ -172,7 +186,7 @@ class VideoTranscoderApp:
             "-c:v libx264 -profile:v main -level 4.0 "
             "-crf 28 -preset medium "
             "-maxrate 8500000 -bufsize 17000000 "
-            '-vf "scale=w=min(iw\,1920):h=-2:force_original_aspect_ratio=decrease,'
+            '-vf "scale=w=min(iw\\,1920):h=-2:force_original_aspect_ratio=decrease,'
             'pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2:x=0:y=0:color=black,'
             'format=yuv420p" '
             "-c:a aac -ac 2 -ar 44100 -b:a 128000 "
@@ -180,6 +194,10 @@ class VideoTranscoderApp:
             "-threads 0 -x264-params \"threads=0:sliced-threads=1\" "
             "-f mp4 -movflags +faststart -y"
         )
+
+        # 设置音频码率 - 在初始化时定义
+        self.AUDIO_BITRATE = 128000  # 128kbps
+        self.MAX_MAXRATE = 8500000  # 8.5Mbps
 
     def on_drop_video(self, event):
         """处理视频文件拖拽事件"""
@@ -264,9 +282,11 @@ class VideoTranscoderApp:
             'file_path': file_path,
             'filename': os.path.basename(file_path),
             'original_size': self.format_file_size(file_size),
+            'estimated_size': '计算中...',  # 预估转码大小
             'transcoded_size': '-',
             'completed_time': '-',
             'duration': '-',
+            'operation': '-',  # 执行操作
             'status': '待执行',
             'start_time': None,
             'end_time': None
@@ -275,6 +295,21 @@ class VideoTranscoderApp:
         self.tasks.append(task)
         self.update_task_display()
 
+        # 在后台线程中计算预估大小
+        threading.Thread(target=self.calculate_and_update_estimate, args=(task,), daemon=True).start()
+
+    def calculate_and_update_estimate(self, task):
+        """在后台线程中计算预估大小并更新界面"""
+        est_output_size = self.estimate_output_size(task['file_path'])
+        if est_output_size == -1:
+            task['estimated_size'] = '预估失败'
+        else:
+            est_output_size_mb = round(est_output_size / 1024 / 1024, 2)
+            task['estimated_size'] = f"{est_output_size_mb} MB"
+
+        # 在主线程中更新界面
+        self.root.after(0, self.update_task_display)
+
     def update_task_display(self):
         """更新任务列表显示"""
         # 清空现有项目
@@ -282,15 +317,24 @@ class VideoTranscoderApp:
             self.task_tree.delete(item)
 
         # 添加任务到列表
-        for task in self.tasks:
+        for i, task in enumerate(self.tasks, 1):  # 从1开始编号
+            # 获取预估大小，如果任务中没有预估大小则显示'-'
+            estimated_size = task.get('estimated_size', '-')
+            operation = task.get('operation', '-')
             self.task_tree.insert('', 'end', values=(
+                i,  # 序号
                 task['filename'],
                 task['original_size'],
+                estimated_size,  # 预估转码大小
                 task['transcoded_size'],
                 task['completed_time'],
                 task['duration'],
+                operation,  # 执行操作
                 task['status']
             ), tags=(task['id'],))
+
+        # 更新统计信息
+        self.update_task_stats()
 
     def format_file_size(self, size_bytes):
         """格式化文件大小显示"""
@@ -303,6 +347,28 @@ class VideoTranscoderApp:
         s = round(size_bytes / p, 2)
         return f"{s} {size_names[i]}"
 
+    def update_task_stats(self):
+        """更新任务统计信息"""
+        total = len(self.tasks)
+        pending = 0
+        completed = 0
+        failed = 0
+
+        for task in self.tasks:
+            status = task['status']
+            if status == '待执行':
+                pending += 1
+            elif status == '已完成' or status == '仅改名':
+                completed += 1
+            elif status == '执行失败':
+                failed += 1
+            elif status == '不执行转码，只改名复制':
+                # 包含"不执行转码，只改名复制"这类状态
+                completed += 1
+
+        stats_text = f"任务统计：共{total}个任务，待处理{pending}个，已完成{completed}个，失败{failed}个"
+        self.stats_label.config(text=stats_text)
+
     def on_task_double_click(self, event):
         """处理任务列表双击事件（用于删除任务）"""
         # 获取被点击的项目
@@ -310,7 +376,7 @@ class VideoTranscoderApp:
         if item:
             # 获取该任务的ID
             values = self.task_tree.item(item, 'values')
-            filename = values[0]  # 文件名是第一列
+            filename = values[1]  # 文件名仍然是第二列（第一列是序号）
 
             # 找到对应的任务
             task_to_remove = None
@@ -411,6 +477,7 @@ class VideoTranscoderApp:
                 self.root.after(0, self.update_task_display)
             elif task['status'] == '仅改名':
                 # 对于仅改名的任务，直接标记为已完成
+                task['operation'] = '仅改名'
                 task['status'] = '已完成'
                 task['duration'] = '0.00秒'
                 task['completed_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -524,7 +591,7 @@ class VideoTranscoderApp:
         if selection:
             item = selection[0]  # 获取第一个选中的项目
             values = self.task_tree.item(item, 'values')
-            filename = values[0]  # 文件名是第一列
+            filename = values[1]  # 文件名是第二列（第一列是序号）
 
             # 找到对应的任务
             for task in self.tasks:
@@ -626,6 +693,7 @@ class VideoTranscoderApp:
                     # 更新任务信息
                     task['file_path'] = new_file_path
                     task['filename'] = new_filename
+                    task['operation'] = '仅改名'
                     task['status'] = '仅改名'
                     task['completed_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     task['duration'] = '0.00秒'
@@ -662,6 +730,27 @@ class VideoTranscoderApp:
 
         input_path = task['file_path']
         output_path = self.get_output_path(input_path)
+
+        # 预估输出体积
+        est_output_size = self.estimate_output_size(input_path)
+        if est_output_size == -1:
+            # 预估失败，直接执行转码
+            task['estimated_size'] = '预估失败'  # 记录预估大小
+            task['status'] = '执行中（预估失败）'
+            print(f"预估输出体积失败，直接执行转码: {input_path}")
+        else:
+            # 计算源文件大小
+            original_size = os.path.getsize(input_path)
+            original_size_mb = round(original_size / 1024 / 1024, 2)
+            est_output_size_mb = round(est_output_size / 1024 / 1024, 2)
+
+            # 记录预估大小
+            task['estimated_size'] = f"{est_output_size_mb} MB"
+            print(f"源文件体积：{original_size_mb} MB，预估输出体积：{est_output_size_mb} MB")
+
+            # 只记录预估信息，不管预估值如何都执行转码
+            task['status'] = f'执行中（预估体积为 {est_output_size_mb} MB）'
+            print(f"执行转码: {input_path}")
 
         try:
             # 获取视频时长用于计算进度
@@ -711,35 +800,41 @@ class VideoTranscoderApp:
                         process.kill()
                     return False
 
-                output = process.stderr.readline()
-                if output == '' and process.poll() is not None:
-                    break
+                if process.stderr is not None:
+                    output = process.stderr.readline()
+                    if output == '' and process.poll() is not None:
+                        break
 
-                if output:
-                    # 将输出添加到错误信息中（包括进度信息）
-                    error_output += output
+                    if output:
+                        # 将输出添加到错误信息中（包括进度信息）
+                        error_output += output
 
-                    # 解析FFmpeg输出，获取进度信息
-                    if 'time=' in output and duration > 0:
-                        # 从输出中提取当前时间
-                        time_parts = output.split('time=')
-                        if len(time_parts) > 1:
-                            time_str = time_parts[1].split()[0]  # 获取时间字符串
-                            try:
-                                # 解析时间格式 HH:MM:SS 或 HH:MM:SS.ms
-                                time_parts = time_str.split(':')
-                                if len(time_parts) == 3:
-                                    hours, minutes, seconds = time_parts
-                                    if '.' in seconds:
-                                        seconds, ms = seconds.split('.')
-                                    else:
-                                        ms = 0
-                                    current_time = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-                                    progress = min(100, (current_time / duration) * 100)
-                                    # 在主线程中更新进度条
-                                    self.root.after(0, lambda prog=progress: self.update_current_progress(prog))
-                            except ValueError:
-                                pass  # 解析时间失败，继续处理
+                        # 解析FFmpeg输出，获取进度信息
+                        if 'time=' in output and duration > 0:
+                            # 从输出中提取当前时间
+                            time_parts = output.split('time=')
+                            if len(time_parts) > 1:
+                                time_str = time_parts[1].split()[0]  # 获取时间字符串
+                                try:
+                                    # 解析时间格式 HH:MM:SS 或 HH:MM:SS.ms
+                                    time_parts = time_str.split(':')
+                                    if len(time_parts) == 3:
+                                        hours, minutes, seconds = time_parts
+                                        if '.' in seconds:
+                                            seconds, ms = seconds.split('.')
+                                        else:
+                                            ms = 0
+                                        current_time = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                                        progress = min(100, (current_time / duration) * 100)
+                                        # 在主线程中更新进度条
+                                        self.root.after(0, lambda prog=progress: self.update_current_progress(prog))
+                                except ValueError:
+                                    pass  # 解析时间失败，继续处理
+                else:
+                    # 如果stderr为None，检查进程是否结束
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.1)  # 短暂休眠避免CPU占用过高
 
             # 获取进程返回码
             return_code = process.returncode
@@ -748,10 +843,27 @@ class VideoTranscoderApp:
                 # 获取转码后文件大小
                 if os.path.exists(output_path):
                     transcoded_size = os.path.getsize(output_path)
-                    task['transcoded_size'] = self.format_file_size(transcoded_size)
-                    # 转码完成，进度条设为100%
-                    self.root.after(0, self.set_current_progress_100)
-                    return True
+                    original_size = os.path.getsize(input_path)  # 获取原文件大小
+
+                    # 检查转码后的文件是否大于原文件的80%
+                    if transcoded_size > original_size * 0.8:
+                        # 转码后文件大于原文件的80%，用原文件替换转码文件
+                        import shutil
+                        shutil.copy2(input_path, output_path)  # 复制原文件到输出路径
+
+                        # 更新任务状态和大小信息
+                        task['operation'] = f'转码后体积: {self.format_file_size(transcoded_size)}，执行复制原文件'
+                        task['transcoded_size'] = self.format_file_size(original_size)
+                        task['status'] = '已完成'
+                        # 进度条设为100%
+                        self.root.after(0, self.set_current_progress_100)
+                        return True
+                    else:
+                        task['operation'] = '已转码'
+                        task['transcoded_size'] = self.format_file_size(transcoded_size)
+                        # 转码完成，进度条设为100%
+                        self.root.after(0, self.set_current_progress_100)
+                        return True
                 else:
                     print(f"转码完成但输出文件不存在: {output_path}")
                     task['error_message'] = f"转码完成但输出文件不存在: {output_path}"
@@ -773,6 +885,160 @@ class VideoTranscoderApp:
             print(f"转码异常: {str(e)}")
             task['error_message'] = str(e)
             return False
+
+    def get_video_bitrate(self, input_path):
+        """获取视频平均码率（bps）"""
+        try:
+            # 尝试获取视频流的码率
+            cmd = f'ffprobe -v quiet -select_streams v:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 "{input_path}"'
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8'
+            )
+            source_vbr = result.stdout.strip()
+            if source_vbr and source_vbr != 'N/A' and source_vbr != '0':
+                source_vbr = int(source_vbr)
+            else:
+                # 如果获取不到码率，通过文件大小和时长计算
+                duration_cmd = f'ffprobe -v quiet -show_entries format=duration -of csv=p=0 "{input_path}"'
+                duration_result = subprocess.run(
+                    duration_cmd,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8'
+                )
+                duration = float(duration_result.stdout.strip())
+                file_size = os.path.getsize(input_path)
+                source_vbr = int((file_size * 8) / duration)
+
+            return source_vbr
+        except Exception as e:
+            print(f"获取视频码率失败: {str(e)}")
+            # 备用方案：通过文件大小和时长计算
+            try:
+                duration_cmd = f'ffprobe -v quiet -show_entries format=duration -of csv=p=0 "{input_path}"'
+                duration_result = subprocess.run(
+                    duration_cmd,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8'
+                )
+                duration = float(duration_result.stdout.strip())
+                file_size = os.path.getsize(input_path)
+                return int((file_size * 8) / duration)
+            except:
+                return 0  # 如果都无法获取，则返回0
+
+    def estimate_output_size(self, input_path):
+        """预估转码后输出体积 - 使用更精确的算法"""
+        try:
+            # 获取视频流码率
+            cmd = f'ffprobe -v quiet -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "{input_path}"'
+            result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, text=True, encoding='utf-8')
+            video_bitrate = 0
+            if result.stdout.strip() and result.stdout.strip() != 'N/A':
+                try:
+                    video_bitrate = int(result.stdout.strip())
+                except ValueError:
+                    video_bitrate = 0
+
+            # 如果无法获取视频流码率，回退到原来的方法
+            if video_bitrate == 0:
+                video_bitrate = self.get_video_bitrate(input_path)
+                if video_bitrate == 0:
+                    # 如果还是无法获取码率，尝试使用文件大小和时长计算
+                    duration_cmd = f'ffprobe -v quiet -show_entries format=duration -of csv=p=0 "{input_path}"'
+                    duration_result = subprocess.run(
+                        duration_cmd,
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding='utf-8'
+                    )
+                    try:
+                        duration = float(duration_result.stdout.strip())
+                        file_size = os.path.getsize(input_path)
+                        video_bitrate = int((file_size * 8) / duration)
+                    except:
+                        return -1  # 无法计算预估体积
+
+            # 获取音频流码率
+            cmd = f'ffprobe -v quiet -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "{input_path}"'
+            audio_result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, text=True, encoding='utf-8')
+            audio_bitrate = 128000  # 默认音频码率
+            if audio_result.stdout.strip() and audio_result.stdout.strip() != 'N/A':
+                try:
+                    audio_bitrate = int(audio_result.stdout.strip())
+                except ValueError:
+                    audio_bitrate = 128000  # 默认128kbps
+
+            # 获取原视频分辨率
+            cmd = f'ffprobe -v quiet -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "{input_path}"'
+            res_result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, text=True, encoding='utf-8')
+            width, height = 1920, 1080  # 默认1080P
+            if res_result.stdout.strip():
+                try:
+                    res_parts = res_result.stdout.strip().split('x')
+                    if len(res_parts) == 2:
+                        width, height = map(int, res_parts)
+                except:
+                    width, height = 1920, 1080
+
+            # 计算分辨率缩放比例（相对于1080P）
+            res_scale = (width * height) / (1920 * 1080)
+
+            # 基于CRF模式的预估 - 对于CRF 28，不同内容类型的码率模型
+            # 动作片、体育节目等复杂内容: 通常需要更高码率
+            # 纪录片、访谈节目等简单内容: 可以用较低码率
+
+            # 估算内容复杂度 - 暂时使用基于分辨率和源码率的简化模型
+            # 对于复杂内容，实际码率可能更高
+            complexity_factor = 1.0
+
+            # 简化的内容复杂度估算 - 如果源码率高于平均水平，则可能是复杂内容
+            if video_bitrate > 8000000:  # 超过8Mbps认为是高复杂度
+                complexity_factor = 1.2
+            elif video_bitrate > 5000000:  # 5-8Mbps之间
+                complexity_factor = 1.1
+            else:  # 低于5Mbps
+                complexity_factor = 0.9
+
+            # 目标视频码率计算 (基于CRF 28 + 复杂度调整 + 分辨率调整)
+            # CRF 28在1080P下平均码率大约在3-4Mbps左右，根据内容和分辨率调整
+            base_target_rate = 3500000  # 基础目标码率3.5Mbps（CRF 28下的1080P参考值）
+            target_video_rate = int(base_target_rate * res_scale * complexity_factor)
+
+            # 确保码率在合理范围内
+            if target_video_rate > self.MAX_MAXRATE:
+                target_video_rate = self.MAX_MAXRATE
+
+            # 获取视频时长
+            duration_cmd = f'ffprobe -v quiet -show_entries format=duration -of csv=p=0 "{input_path}"'
+            duration_result = subprocess.run(
+                duration_cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8'
+            )
+            duration = float(duration_result.stdout.strip())
+
+            # 预估输出体积 = (目标视频码率 + 音频码率) * 时长 / 8 * 1.01 (1%开销)
+            est_output_size = int((target_video_rate + self.AUDIO_BITRATE) * duration / 8 * 1.01)
+            return est_output_size
+        except Exception as e:
+            print(f"预估输出体积失败: {str(e)}")
+            return -1  # 预估失败
 
     def get_output_path(self, input_path):
         """获取输出文件路径"""
@@ -798,7 +1064,7 @@ class VideoTranscoderApp:
             else:
                 return os.path.join(output_dir, f"{name}_transcoded{ext}")
         else:
-            # 不输出到原目录 - 保存到当前程序目录
+            # 不输出到原目录 - 保存到桌面的"当前日期、时间+转码后文件"文件夹
             filename = os.path.basename(input_path)
             name, ext = os.path.splitext(filename)
 
@@ -810,7 +1076,15 @@ class VideoTranscoderApp:
                 # 替换文件名中的关键字
                 name = name.replace(scan_keyword, replace_keyword)
 
-            output_dir = os.path.dirname(os.path.abspath(__file__))
+            # 获取当前日期时间
+            current_date = datetime.now().strftime('%Y-%m-%d')
+
+            # 获取桌面路径
+            desktop_path = str(Path.home() / "Desktop")
+
+            # 创建带当前时间的文件夹
+            output_dir = os.path.join(desktop_path, f"{current_date}_转码后文件")
+            os.makedirs(output_dir, exist_ok=True)
 
             # 检查转码参数是否包含 -f mp4，如果是则强制使用 .mp4 扩展名
             if "-f mp4" in self.ffmpeg_params or "-fmp4" in self.ffmpeg_params:
@@ -831,6 +1105,7 @@ class VideoTranscoderApp:
                 f.write(f"原文件大小: {task['original_size']}\n")
                 f.write(f"转码后大小: {task['transcoded_size']}\n")
                 f.write(f"转码用时: {task['duration']}\n")
+                f.write(f"执行操作: {task['operation']}\n")
                 f.write(f"转码状态: {task['status']}\n")
 
                 if task['status'] == '执行失败':
@@ -838,6 +1113,85 @@ class VideoTranscoderApp:
                     f.write(f"错误信息: {error_msg}\n")
 
                 f.write("-" * 30 + "\n")
+
+        # 额外保存一份详细日志到输出文件夹
+        self.save_detailed_log_to_output_folder()
+
+    def save_detailed_log_to_output_folder(self):
+        """保存详细日志到输出文件夹"""
+        try:
+            # 获取当前时间戳用于创建日志文件夹
+            current_date = datetime.now().strftime('%Y-%m-%d')
+            desktop_path = str(Path.home() / "Desktop")
+            output_dir = os.path.join(desktop_path, f"{current_date}_转码后文件")
+            os.makedirs(output_dir, exist_ok=True)
+
+            # 创建详细日志文件
+            detailed_log_path = os.path.join(output_dir, f"转码任务详细日志_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt")
+
+            with open(detailed_log_path, "w", encoding="utf-8-sig") as f:
+                f.write(f"转码任务详细日志 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("="*60 + "\n\n")
+                f.write(f"{'序号':<4} {'文件名':<30} {'原文件大小':<12} {'预估转码大小':<15} {'转码后大小':<12} {'完成时间':<20} {'转码用时':<10} {'执行操作':<12} {'转码状态':<12}\n")
+                f.write("-" * 140 + "\n")
+
+                for i, task in enumerate(self.tasks, 1):
+                    # 限制文件名长度以适应表格
+                    filename = task['filename'][:28] + "..." if len(task['filename']) > 28 else task['filename']
+
+                    f.write(f"{i:<4} {filename:<30} {task['original_size']:<12} {task['estimated_size']:<15} "
+                           f"{task['transcoded_size']:<12} {task['completed_time']:<20} {task['duration']:<10} "
+                           f"{task['operation']:<12} {task['status']:<12}\n")
+
+                f.write("\n" + "="*60 + "\n")
+                f.write("详细任务信息:\n\n")
+
+                for task in self.tasks:
+                    f.write(f"文件名: {task['filename']}\n")
+                    f.write(f"文件路径: {task['file_path']}\n")
+                    f.write(f"原文件大小: {task['original_size']}\n")
+                    f.write(f"预估转码大小: {task['estimated_size']}\n")
+                    f.write(f"转码后大小: {task['transcoded_size']}\n")
+                    f.write(f"完成时间: {task['completed_time']}\n")
+                    f.write(f"转码用时: {task['duration']}\n")
+                    f.write(f"执行操作: {task['operation']}\n")
+                    f.write(f"转码状态: {task['status']}\n")
+
+                    if task.get('error_message'):
+                        f.write(f"错误信息: {task['error_message']}\n")
+
+                    f.write("-" * 50 + "\n")
+        except Exception as e:
+            print(f"保存详细日志到输出文件夹失败: {str(e)}")
+
+    def calculate_all_estimates(self):
+        """计算所有任务的预估大小"""
+        if not self.tasks:
+            messagebox.showinfo("提示", "没有任务需要计算预估大小")
+            return
+
+        # 更新所有任务的预估大小状态
+        for task in self.tasks:
+            if task['status'] == '待执行':  # 只对未执行的任务计算预估大小
+                task['estimated_size'] = '计算中...'
+        self.update_task_display()
+
+        # 在后台线程中计算所有任务的预估大小
+        threading.Thread(target=self.calculate_all_estimates_thread, daemon=True).start()
+
+    def calculate_all_estimates_thread(self):
+        """在后台线程中计算所有任务的预估大小"""
+        for task in self.tasks:
+            if task['status'] == '待执行':  # 只对未执行的任务计算预估大小
+                est_output_size = self.estimate_output_size(task['file_path'])
+                if est_output_size == -1:
+                    task['estimated_size'] = '预估失败'
+                else:
+                    est_output_size_mb = round(est_output_size / 1024 / 1024, 2)
+                    task['estimated_size'] = f"{est_output_size_mb} MB"
+
+        # 在主线程中更新界面
+        self.root.after(0, self.update_task_display)
 
 
 if __name__ == "__main__":
